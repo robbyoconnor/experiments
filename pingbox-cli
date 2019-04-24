@@ -1,0 +1,199 @@
+#!/bin/bash
+
+# Check run as root
+if [ "$UID" -ne 0 ] ; then
+    echo "You must be root to run this script!"
+    exit 1
+fi
+
+# CLI colors
+RED='\e[0;31m'
+GREEN='\e[0;32m'
+BLUE='\e[0;34m'
+NC='\e[0m'
+
+#DHCP
+SUBNET="192.168.162"
+IP="192.168.162.1"
+NETMASK="/24"
+DNS_SERVER="1.1.1.1"
+
+pushd "$(dirname "$0")" > /dev/null
+PATHSCRIPT=$(pwd)
+popd > /dev/null
+
+show_usage () {
+    echo -e "Usage: $0 <start|stop> [interface]"
+}
+
+if [ "$1" == "help" ] || [ "$#" -eq 0 ]
+then
+    show_usage
+elif [ "$#" -eq 0 ] || [ "$#" -gt 2 ]
+then
+    show_usage
+fi
+
+init () {
+    IFACE="$1"
+
+    # Check that the requested iface is available
+    if ! [ -e /sys/class/net/"$IFACE" ]
+    then
+        echo -e "${RED}[ERROR]${NC} The interface provided does not exist. Exiting..."
+        exit 1
+    fi
+
+
+    # Check that the given interface is not used by the host as the default route
+    if [[ $(ip r | grep default | cut -d " " -f5) == "$IFACE" ]]
+    then
+        echo -e "${BLUE}[INFO]${NC} The selected interface is configured as the default route, if you use it you will lose internet connectivity"
+        while true;
+        do
+            read -p "Do you wish to continue? [y/n]" yn
+            case $yn in
+                [Yy]* ) break;;
+                [Nn]* ) exit;;
+                * ) echo "Please answer yes or no.";;
+            esac
+        done
+	fi
+
+    ### Check if hostapd is running in the host
+    hostapd_pid=$(pgrep hostapd)
+    if [ ! "$hostapd_pid" == "" ] 
+    then
+        echo -e "${BLUE}[INFO]${NC} hostapd service is already running in the system, make sure you use a different wireless interface..."
+    fi
+
+    # Find the physical interface for the given wireless interface
+    PHY=$(cat /sys/class/net/"$IFACE"/phy80211/name)
+
+    echo -e "${BLUE}[INFO]${NC} Architecture: ${GREEN}$(arch)${NC}"
+
+    # Checking for busybox image
+    IMG_CHECK=$(docker images -q busybox)
+    if [ "$IMG_CHECK" == "" ]
+    then
+        echo -e "${BLUE}[INFO]${NC} Docker image ${RED}busybox${NC} not found"
+        echo -e "[+] Pulling the image ${GREEN}busybox${NC}"
+        docker pull busybox
+    fi
+
+    # Checking if the dhcp image has been already built
+    IMG_CHECK=$(docker images -q pingbox/pingbox-dhcp)
+    if [ "$IMG_CHECK" != "" ]
+    then
+        echo -e "${BLUE}[INFO]${NC} Docker image ${GREEN}pingbox/pingbox-dhcp${NC} found"
+    else
+        echo -e "${BLUE}[INFO]${NC} Docker image ${RED}pingbox/pingbox-dhcp${NC} not found"
+        # Option 1: Building
+        echo -e "[+] Building the image ${GREEN}pingbox/pingbox-dhcp${NC}"
+        docker build --rm -t pingbox/pingbox-dhcp -f "$PATHSCRIPT"/Dockerfile_dhcp .
+    fi
+
+    # Checking if the ap image has been already built
+    IMG_CHECK=$(docker images -q pingbox/pingbox-ap)
+    if [ "$IMG_CHECK" != "" ]
+    then
+        echo -e "${BLUE}[INFO]${NC} Docker image ${GREEN}pingbox/pingbox-ap${NC} found"
+    else
+        echo -e "${BLUE}[INFO]${NC} Docker image ${RED}pingbox/pingbox-ap${NC} not found"
+        # Option 1: Building
+        echo -e "[+] Building the image ${GREEN}pingbox/pingbox-ap${NC}"
+        docker build --rm -t pingbox/pingbox-ap -f "$PATHSCRIPT"/Dockerfile_ap .
+    fi
+
+    # Bring the wireless interface up
+    ip link set "$IFACE" up
+
+    ### Generating dnsmasq.conf file
+    echo -e "[+] Generating dnsmasq.conf" 
+    sed -e "s/_DNS_SERVER/$DNS_SERVER/g" -e "s/_IFACE/$IFACE/" -e "s/_SUBNET_START/$SUBNET.20/g" -e \
+     "s/_SUBNET_END/$SUBNET.254/g" "$PATHSCRIPT"/templates/dnsmasq.template > "$PATHSCRIPT"/dnsmasq.conf
+
+    sed -e "s/_IFACE/$IFACE/" "$PATHSCRIPT"/templates/hostapd.template > "$PATHSCRIPT"/hostapd.conf
+}
+
+service_start () {
+    IFACE="$1"
+    echo -e "[+] Starting ${GREEN}busybox${NC} as network namespace"
+    docker run -dt --name pingbox-netns --net=bridge busybox > /dev/null 2>&1
+    pid=$(docker inspect -f '{{.State.Pid}}' pingbox-netns)
+
+    # Assign phy wireless interface to the container 
+    mkdir -p /var/run/netns
+    ln -s /proc/"$pid"/ns/net /var/run/netns/"$pid"
+    iw phy "$PHY" set netns "$pid"
+
+    ### Assign an IP to the wifi interface
+    echo -e "[+] Configuring ${GREEN}$IFACE${NC} with IP address ${GREEN}$IP${NC}"
+    ip netns exec "$pid" ip addr flush dev "$IFACE"
+    ip netns exec "$pid" ip link set "$IFACE" up
+    ip netns exec "$pid" ip addr add "$IP$NETMASK" dev "$IFACE"
+
+    ### iptables rules for NAT
+    echo "[+] Adding natting rule to iptables (container)"
+    ip netns exec "$pid" iptables -t nat -A POSTROUTING -s $SUBNET.0$NETMASK ! -d $SUBNET.0$NETMASK -j MASQUERADE
+
+    ### Enable IP forwarding
+    echo "[+] Enabling IP forwarding (container)"
+    ip netns exec "$pid" echo 1 > /proc/sys/net/ipv4/ip_forward
+
+    echo -e "[+] Starting the docker container with name ${GREEN}pingbox-dhcp${NC}"
+    docker run -dt --name pingbox-dhcp --network=container:pingbox-netns --cap-add=NET_ADMIN \
+     --cap-add=NET_RAW -v "$PATHSCRIPT"/dnsmasq.conf:/etc/dnsmasq.conf pingbox/pingbox-dhcp > /dev/null 2>&1
+
+    echo -e "[+] Starting the docker container with name ${GREEN}pingbox-ap${NC}"
+    docker run -dt --name pingbox-ap --network=container:pingbox-netns --cap-add=NET_ADMIN \
+     --cap-add=NET_RAW -v "$PATHSCRIPT"/hostapd.conf:/etc/hostapd.conf pingbox/pingbox-ap > /dev/null 2>&1
+
+    docker logs --tail 50 --follow --timestamps pingbox-ap
+}
+
+service_stop () { 
+    IFACE="$1"
+    echo -e "[-] Stopping containers"
+    docker stop pingbox-dhcp > /dev/null 2>&1
+    docker stop pingbox-ap > /dev/null 2>&1
+    docker stop pingbox-netns > /dev/null 2>&1
+    echo -e "[-] Removing containers"
+    docker rm pingbox-dhcp > /dev/null 2>&1
+    docker rm pingbox-ap > /dev/null 2>&1
+    docker rm pingbox-netns > /dev/null 2>&1
+    echo [-] Removing conf files
+    if [ -e "$PATHSCRIPT"/dnsmasq.conf ]
+    then
+        rm "$PATHSCRIPT"/dnsmasq.conf
+    fi
+    echo [-] Removing IP address in "$IFACE"
+    ip addr del "$IP$NETMASK" dev "$IFACE" > /dev/null 2>&1
+    # Clean up dangling symlinks in /var/run/netns
+    find -L /var/run/netns -type l -delete
+}
+
+if [ "$1" == "start" ]
+then
+    if [[ -z "$2" ]]
+    then
+        echo -e "${RED}[ERROR]${NC} No interface provided. Exiting..."
+        exit 1
+    fi
+    IFACE=${2}
+    service_stop "$IFACE"
+    clear    
+    init "$IFACE"
+    service_start "$IFACE"
+elif [ "$1" == "stop" ]
+then
+    if [[ -z "$2" ]]
+    then
+        echo -e "${RED}[ERROR]${NC} No interface provided. Exiting..."
+        exit 1
+    fi
+    IFACE=${2}
+    service_stop "$IFACE"
+else
+    echo "Usage: $0 <start|stop> <interface>"
+fi
